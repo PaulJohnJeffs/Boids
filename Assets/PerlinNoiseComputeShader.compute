@@ -1,0 +1,28 @@
+#pragma kernel CSMain
+
+struct Vert
+{
+	float3 Position;
+};
+
+float Seed;
+int VertsPerSide;
+int Iterations;
+
+RWStructuredBuffer<Vert> verts;
+
+float nrand(float2 uv)
+{
+    return frac(sin(dot(uv, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+[numthreads(1, 1, 1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+	for (int i = 0; i < Iterations; i++)
+	{
+		Vert v = verts[id.x + (id.y * VertsPerSide)];
+		v.Position = float3(v.Position.x, nrand(float2(Seed, Seed) + id.xy), v.Position.z);
+		verts[id.x + (id.y * VertsPerSide)] = v;
+	}
+}

@@ -1,0 +1,194 @@
+struct BoidData
+{
+	float3 Position;
+	float3 Forward;
+};
+
+RWStructuredBuffer<BoidData> Boids;
+RWStructuredBuffer<BoidData> SortedBoids;
+
+RWStructuredBuffer<uint2> BoidPartitionIndices;
+RWStructuredBuffer<uint> BoidsPerPartition;
+
+RWStructuredBuffer<int> PrefixSumLast;
+RWStructuredBuffer<int> PrefixSumCurrent;
+
+int NumPartitionsPerDimension;
+int PrefixSumPower;
+int NumBoids;
+
+float SightRange;
+float SightRangeSqr;
+float DeltaTime;
+float Speed;
+float Bounds;
+
+float EvadeWeight;
+float AlignWeight;
+float FlockWeight;
+float FlockSpacing;
+float EvadeSpacing;
+
+float4 MultiplyQuaternions(float4 q, float4 r)
+{
+	float3 crossProd = cross(q.xyz, r.xyz);
+	float dotProd = dot(q.xyz, r.xyz);
+
+	float3 real = crossProd + (q.w * r.xyz) + (r.w * q.xyz);
+	float imaginary = (q.w * r.w) - dotProd;
+
+	return float4 (real, imaginary); 
+}
+
+float4 AngleAxisQuaternion(float radians, float3 axis)
+{
+	float sinTerm = sin(radians / 2);
+	float cosTerm = cos(radians / 2);
+
+	return float4(normalize(axis) * sinTerm, cosTerm);
+}
+
+#pragma kernel UpdateBoids
+[numthreads(256,1,1)]
+void UpdateBoids (uint3 id : SV_DispatchThreadID)
+{
+	BoidData thisBoid = Boids[id.x];
+	SightRangeSqr = SightRange * SightRange;
+	//float3 direction = Boids[id.x].Forward;
+	float distToClosestOther = SightRangeSqr;
+	//float dotToClosestOther;
+	float3 toClosestOther;
+
+	float3 localFlockPos = float3(0, 0, 0);
+	float3 localTrend = float3(0, 0, 0);
+	int numOthersInRange = 0;
+
+	int numPartitionsPerPlane = NumPartitionsPerDimension * NumPartitionsPerDimension;
+	int partitionIdx = BoidPartitionIndices[id.x].x;
+
+	int xMid = (partitionIdx % numPartitionsPerPlane) % NumPartitionsPerDimension;
+	int yMid = (partitionIdx % numPartitionsPerPlane) / NumPartitionsPerDimension;
+	int zMid = partitionIdx / numPartitionsPerPlane;
+
+	for (int z = zMid - 1; z <= zMid + 1; z++)
+	{
+		for (int y = yMid - 1; y <= yMid + 1; y++)
+		{
+			for (int x = xMid - 1; x <= xMid + 1; x++)
+			{
+				int adjacentPartitionIdx = x + (y * NumPartitionsPerDimension) + (z * numPartitionsPerPlane);
+				int numBoidsInPartition = BoidsPerPartition[adjacentPartitionIdx];
+				int partitionStart = PrefixSumCurrent[adjacentPartitionIdx] - numBoidsInPartition;
+				int partitionEnd = PrefixSumCurrent[adjacentPartitionIdx] - 1;
+
+				for	(int boidIdx = partitionStart; boidIdx <= partitionEnd; boidIdx++)
+				{
+					BoidData otherBoid = SortedBoids[boidIdx];
+
+					float3 toOther = otherBoid.Position - thisBoid.Position;
+					float dSq = toOther.x * toOther.x + toOther.y * toOther.y + toOther.z * toOther.z;
+
+					if (dSq == 0 || dSq > SightRangeSqr)
+						continue;
+
+					numOthersInRange++;
+					localTrend += otherBoid.Forward;
+					localFlockPos += toOther;
+
+					float distToOther = length(toOther);
+					if (distToOther < distToClosestOther)
+					{
+						distToClosestOther = distToOther;
+						toClosestOther = toOther;
+					}
+				}
+			}
+		}
+	}
+
+	if (numOthersInRange != 0)
+	{
+		localFlockPos /= numOthersInRange;
+		float3 turn = float3(0, 0, 0);
+		if (distToClosestOther < EvadeSpacing)
+		{
+			turn += EvadeWeight * -toClosestOther;
+		}
+		else if (length(localFlockPos) > FlockSpacing)
+		{
+			turn += FlockWeight * localFlockPos;
+		}
+
+		turn += localTrend * AlignWeight;
+
+		//float flockDirection = (length(localFlockPos) - FlockSpacing) / FlockSpacing;
+		//float3 flock = flockDirection * normalize(localFlockPos) * FlockWeight;
+
+		//float3 align = normalize(localTrend) * AlignWeight;
+
+		Boids[id.x].Forward += DeltaTime * turn;
+	}
+
+	Boids[id.x].Position += Speed * DeltaTime * Boids[id.x].Forward;
+	Boids[id.x].Forward = normalize(Boids[id.x].Forward);
+	float3 forward = Boids[id.x].Forward;
+	Boids[id.x].Forward = saturate(length(forward)) * normalize(forward);
+
+	float3 pos = Boids[id.x].Position;
+
+	float xDelta = ((pos.x < 0) * Bounds) + ((pos.x > Bounds) * -Bounds);
+	float yDelta = ((pos.y < 0) * Bounds) + ((pos.y > Bounds) * -Bounds);
+	float zDelta = ((pos.z < 0) * Bounds) + ((pos.z > Bounds) * -Bounds);
+
+	Boids[id.x].Position += float3(xDelta, yDelta, zDelta);
+}
+
+#pragma kernel PartitionBoids
+[numthreads(256, 1, 1)]
+void PartitionBoids (uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= NumBoids)
+	{
+		return;
+	}
+
+	BoidData boid = Boids[id.x];
+	float3 pos = boid.Position;
+	uint3 coords = uint3(
+		trunc(pos.x / SightRange),
+		trunc(pos.y / SightRange),
+		trunc(pos.z / SightRange));
+
+	uint partitionIdx = coords.x + (coords.y * NumPartitionsPerDimension) + (coords.z * NumPartitionsPerDimension * NumPartitionsPerDimension);
+	BoidPartitionIndices[id.x].x = partitionIdx;
+	InterlockedAdd(BoidsPerPartition[partitionIdx], 1, BoidPartitionIndices[id.x].y);
+}
+
+#pragma kernel Sort
+[numthreads(256, 1, 1)]
+void Sort (uint3 id : SV_DispatchThreadID)
+{
+	BoidData boid = Boids[id.x];
+	int partitionIdx = BoidPartitionIndices[id.x].x;
+	int numBoidsInPartition = BoidsPerPartition[partitionIdx];
+	int partitionStart = PrefixSumCurrent[partitionIdx] - numBoidsInPartition;
+	int globalIdx = partitionStart + BoidPartitionIndices[id.x].y;
+
+	SortedBoids[globalIdx] = boid;
+}
+
+#pragma kernel SumPartitionCounts
+[numthreads(256, 1, 1)]
+void SumPartitionCounts (uint3 id : SV_DispatchThreadID)
+{
+	PrefixSumCurrent[id.x] = PrefixSumLast[id.x] + ((id.x >= PrefixSumPower) * PrefixSumLast[id.x - PrefixSumPower]);
+}
+
+#pragma kernel ClearSums
+[numthreads(256, 1, 1)]
+void ClearSums(uint3 id : SV_DispatchThreadID)
+{
+	BoidsPerPartition[id.x] = 0;
+	PrefixSumLast[id.x] = 0;
+	PrefixSumCurrent[id.x] = 0;
+}
